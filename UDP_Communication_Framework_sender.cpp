@@ -211,20 +211,24 @@ static void MD5Transform(uint32_t state[4], const unsigned char block[64]) {
     state[3] += d;
     memset(x, 0, sizeof x);
 }
-#define TARGET_IP	"192.168.136.39"
+#define TARGET_IP	"127.0.0.1"
 
 #define BUFFERS_LEN 1024
+#define DATA_LEN 1016
+#define NUMBER_LEN 4
+#define CRC_LEN 4
+#define WINDOW_LENGTH 20
 
-//#define SENDER
-#define RECEIVER
+#define SENDER
+//#define RECEIVER
 
 #ifdef SENDER
-#define TARGET_PORT 5322
-#define LOCAL_PORT 5190
+#define TARGET_PORT 5412
+#define LOCAL_PORT 5478
 #endif // SENDER
 
 #ifdef RECEIVER
-#define TARGET_PORT 5477
+#define TARGET_PORT 5190
 #define LOCAL_PORT 5324
 #endif // RECEIVER
 
@@ -254,68 +258,154 @@ uint32_t crc32(const void* data, size_t n_bytes) {
     }
     return ~crc;
 }
-bool processReceivedPacket(SOCKET socketS, char* buffer_rx, int data_len, FILE* fp, sockaddr_in from, sockaddr_in addrDest, int& packetIndex, char* lastBuffer, uint32_t* last_packet_number, int size) {
+// false if not in list
+bool isInList(uint32_t* ListOfUints, uint32_t number, size_t length) {
+    for (int i = 0; i < length; i++) {
+        if (ListOfUints[i] == number) {
+            return true;
+        }
+    }
+    return false;
+}
+//returns false if there is no such number
+bool replaceInList(uint32_t* ListOfUints, uint32_t numberReplaced, uint32_t numberReplacor, size_t length) {
+    for (int i = 0; i < length; i++) {
+        if (ListOfUints[i] == numberReplaced) {
+            ListOfUints[i] = numberReplacor;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool addToListCycle(uint32_t* ListOfUints, uint32_t number, size_t length, size_t* index) {
+    ListOfUints[*index] = number;
+    (*index)++;
+    if (*index >= length) {
+        *index = 0;
+    }
+    return true;
+}
+
+bool processReceivedPacket(SOCKET socketS, char* buffer_rx, int data_len, FILE* fp, sockaddr_in from, sockaddr_in addrDest, int& packetIndex, char* lastBuffer, uint32_t* last_packet_number, int size, uint32_t packetsBefore) {
     uint32_t received_crc;
     memcpy(&received_crc, buffer_rx + data_len, sizeof(received_crc)); // Extrahujeme CRC z p�ijat�ho bufferu
     uint32_t calculated_crc = crc32(buffer_rx, data_len); // Vypo��t�me CRC z dat
     uint32_t current_packet_number;
     memcpy(&current_packet_number, buffer_rx, sizeof(current_packet_number));
     char* sizechar = "size";
+    char ack[10];
 
-
-    if ((received_crc == calculated_crc) && memcmp(sizechar, buffer_rx, sizeof(sizechar)) == 0) {
-        printf("Duplicate packet size received, sending ACK only.\n");
-        sendto(socketS, "ACK", 3, 0, (sockaddr*)&addrDest, sizeof(addrDest)); // Odes?l?me ACK
-        return false; // Packet je stejn? jako posledn?, data nezapisujeme, jen odes?l?me ACK
-    }
-    else if ((received_crc == calculated_crc) && (current_packet_number == *last_packet_number)) {
-        printf("Duplicate packet number %d received, sending ACK only.\n", packetIndex);
-        sendto(socketS, "ACK", 3, 0, (sockaddr*)&addrDest, sizeof(addrDest)); // Odes?l?me ACK
-        return false; // Packet je stejn? jako posledn?, data nezapisujeme, jen odes?l?me ACK
-    }
-
-    else if (received_crc == calculated_crc) {
+    if (received_crc == calculated_crc) {
         printf("Packet number %d expected\n", packetIndex);
         printf("Packet number %d received \n", current_packet_number);
         if (packetIndex == -1)
         {
-            printf("sss");
             int lastLen = size % (data_len - sizeof(uint32_t));
             printf("%d", lastLen);
-            fwrite(buffer_rx + sizeof(uint32_t), 1, lastLen * sizeof(char), fp); // Zapisujeme data do souboru
+            size_t offset = packetsBefore - 1 * DATA_LEN;
+            fseek(fp, offset, SEEK_SET);
+            fwrite(buffer_rx + sizeof(uint32_t), 1, lastLen * sizeof(char), fp);
             printf("Packet number %d received correctly.\n", packetIndex);
             sendto(socketS, "ACK", 3, 0, (sockaddr*)&addrDest, sizeof(addrDest));
             memcpy(lastBuffer, buffer_rx, BUFFERS_LEN); // Odes?l?me ACK
-            memcpy(last_packet_number, buffer_rx, sizeof(*last_packet_number));
             return true;
         }
         else {
-            fwrite(buffer_rx + sizeof(uint32_t), 1, data_len - sizeof(uint32_t), fp); // Zapisujeme data do souboru
-            //printf("Packet last %d received correctly.\n", last_packet_number);
-            printf("Packet number %d received correctly.\n", packetIndex);
-            //printf("Packet last %d received correctly.\n", last_packet_number);
-            sendto(socketS, "ACK", 3, 0, (sockaddr*)&addrDest, sizeof(addrDest));
-            memcpy(lastBuffer, buffer_rx, BUFFERS_LEN); // Odes�l�me ACK
-            memcpy(last_packet_number, buffer_rx, sizeof(last_packet_number));
+            memset(buffer_rx, 0, BUFFERS_LEN);
+            memcpy(ack, "ACK", 3);
+            memcpy(buffer_rx, ack, sizeof(ack));
+            memcpy(buffer_rx + sizeof(ack), &current_packet_number, sizeof(current_packet_number));
+            calculated_crc = crc32(buffer_rx, sizeof(current_packet_number) + sizeof(ack));
+            memcpy(buffer_rx + sizeof(current_packet_number) + sizeof(ack), &calculated_crc, sizeof(calculated_crc));
+            sendto(socketS, buffer_rx, sizeof(current_packet_number) + sizeof(ack) + sizeof(calculated_crc), 0, (sockaddr*)&addrDest, sizeof(addrDest));
             return true;
         }
     }
-    else {
-        printf("CRC error in packet number %d. Requesting retransmission.\n", packetIndex);
-        sendto(socketS, "NACK", 4, 0, (sockaddr*)&addrDest, sizeof(addrDest)); // Odes?l?me NACK
-        return false;
-        // Nezvy�ujeme index, �ek�me na retransmisi
+}
+bool processReceivedPackets(SOCKET socketS, char* buffer_rx, int data_len, FILE* fp, sockaddr_in from, sockaddr_in addrDest, char* lastBuffer, uint32_t* last_packet_number, int size, int& fromlen) {
+    uint32_t received_crc;
+    uint32_t calculated_crc; // Vypo��t�me CRC z dat
+    uint32_t current_packet_number;
+    uint32_t currentlyRecieved[WINDOW_LENGTH];
+    size_t currentlyRecievedLength = WINDOW_LENGTH;
+    uint32_t LastTenTimesRecieved[WINDOW_LENGTH * 10];
+    size_t LastTenTimesRecievedLength = WINDOW_LENGTH * 10;
+    LastTenTimesRecieved[0] = 0;
+    size_t indexInTenTimes = 1;
+    size_t indexInRecieved = 0;
+    char ack[10];
+
+
+
+    char* sizechar = "size";
+    while (true) {
+        for (size_t i = 0; i < WINDOW_LENGTH; i++)
+        {
+            bool newPacket = false;
+            memset(buffer_rx, 0, BUFFERS_LEN);
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(socketS, &read_fds);
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 5000; //2 ms
+            int selectResult = select(socketS + 1, &read_fds, NULL, NULL, &tv);
+            if (selectResult > 0) {
+                recvfrom(socketS, buffer_rx, BUFFERS_LEN, 0, (sockaddr*)&from, &fromlen);
+                memcpy(&received_crc, buffer_rx + data_len, sizeof(received_crc)); // Extrahujeme CRC z p�ijat�ho bufferu
+                calculated_crc = crc32(buffer_rx, data_len);
+                memcpy(&current_packet_number, buffer_rx, sizeof(current_packet_number));
+                if ((received_crc == calculated_crc) && isInList(LastTenTimesRecieved, current_packet_number, LastTenTimesRecievedLength)) {
+                    printf("Duplicate packet number %d received, sending ACK only.\n", current_packet_number);
+                    currentlyRecieved[i] = current_packet_number;
+                    indexInRecieved++;
+                }
+                else if (received_crc == calculated_crc) {
+                    printf("Packet number %d received \n", current_packet_number);
+                    currentlyRecieved[i] = current_packet_number;
+                    indexInRecieved++;
+                    addToListCycle(LastTenTimesRecieved, current_packet_number, LastTenTimesRecievedLength, &indexInTenTimes);
+                    size_t offset = currentlyRecieved[i] * DATA_LEN;
+                    fseek(fp, offset, SEEK_SET);
+                    fwrite(buffer_rx + sizeof(uint32_t), 1, data_len - sizeof(uint32_t), fp);
+                }
+                else {
+                    // mozna poslat nack nebo ignorovat a pak poslat znovu?
+                }
+            }
+            else {
+                // nic nepřišlo
+            }
+        }
+        for (size_t i = 0; i < WINDOW_LENGTH; i++) {
+            if (i < indexInRecieved) {
+                memset(buffer_rx, 0, BUFFERS_LEN);
+                memcpy(ack, "ACK", 3);
+                memcpy(buffer_rx, ack, sizeof(ack));
+                memcpy(buffer_rx + sizeof(ack), &currentlyRecieved[i], sizeof(currentlyRecieved[i]));
+                calculated_crc = crc32(buffer_rx, sizeof(currentlyRecieved[i]) + sizeof(ack));
+                memcpy(buffer_rx + sizeof(currentlyRecieved[i]) + sizeof(ack), &calculated_crc, sizeof(calculated_crc));
+                sendto(socketS, buffer_rx, sizeof(currentlyRecieved[i]) + sizeof(ack) + sizeof(calculated_crc), 0, (sockaddr*)&addrDest, sizeof(addrDest));
+                Sleep(2);
+            }
+            else {
+                Sleep(2);
+            }
+        }
+        indexInRecieved = 0;
     }
 }
-
-void sendDataPacket(SOCKET socketS, char* buffer_tx, int data_len, sockaddr_in addrDest, sockaddr_in& from, int& fromlen, FILE* file, uint32_t packet_number) {
+void sendLastDataPacket(SOCKET socketS, char* buffer_tx, int ata_len, sockaddr_in addrDest, sockaddr_in& from, int& fromlen, FILE* file, uint32_t packet_number, uint32_t number_for_read, uint32_t size) {
     char ack[10];
-    int readLen = data_len - sizeof(uint32_t);
+    //int readLen = data_len - sizeof(uint32_t);
     // �ten� dat ze souboru a v�po�et CRC
-    fread(buffer_tx + sizeof(uint32_t), sizeof(char), readLen, file);
+    size_t offset = number_for_read * DATA_LEN;
+    fseek(file, offset, SEEK_SET);
+    fread(buffer_tx + sizeof(uint32_t), sizeof(char), size % DATA_LEN, file);
     memcpy(buffer_tx, &packet_number, sizeof(packet_number));
-    uint32_t crc_value = crc32(buffer_tx, data_len);
-    memcpy(buffer_tx + data_len, &crc_value, sizeof(crc_value));
+    uint32_t crc_value = crc32(buffer_tx, DATA_LEN + NUMBER_LEN);
+    memcpy(buffer_tx + DATA_LEN + NUMBER_LEN, &crc_value, sizeof(crc_value));
     printf("number sent %d\n", packet_number);
     int num_of_whiles = 0;
     // Opakov�n� odesl�n� dokud neobdr��me "ACK"
@@ -327,7 +417,7 @@ void sendDataPacket(SOCKET socketS, char* buffer_tx, int data_len, sockaddr_in a
                 break;
             }
         }
-        sendto(socketS, buffer_tx, data_len + sizeof(crc_value), 0, (sockaddr*)&addrDest, sizeof(addrDest));
+        sendto(socketS, buffer_tx, DATA_LEN + NUMBER_LEN + CRC_LEN, 0, (sockaddr*)&addrDest, sizeof(addrDest));
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(socketS, &read_fds);
@@ -345,6 +435,147 @@ void sendDataPacket(SOCKET socketS, char* buffer_tx, int data_len, sockaddr_in a
             continue;
         }
     } while (!(strncmp(ack, "ACK", 3) == 0));
+}
+void sendFirstDataPacket(SOCKET socketS, char* buffer_tx, int ata_len, sockaddr_in addrDest, sockaddr_in& from, int& fromlen, FILE* file, uint32_t packet_number) {
+    char ack[10];
+    //int readLen = data_len - sizeof(uint32_t);
+    // ?ten? dat ze souboru a v?po?et CRC
+    fread(buffer_tx + sizeof(uint32_t), sizeof(char), DATA_LEN, file);
+    memcpy(buffer_tx, &packet_number, sizeof(packet_number));
+    uint32_t crc_value = crc32(buffer_tx, DATA_LEN + NUMBER_LEN);
+    memcpy(buffer_tx + DATA_LEN + NUMBER_LEN, &crc_value, sizeof(crc_value));
+    printf("number sent %d\n", packet_number);
+    // Opakov?n? odesl?n? dokud neobdr??me "ACK"
+    do {
+        sendto(socketS, buffer_tx, DATA_LEN + NUMBER_LEN + CRC_LEN, 0, (sockaddr*)&addrDest, sizeof(addrDest));
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(socketS, &read_fds);
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+        int selectResult = select(socketS + 1, &read_fds, NULL, NULL, &tv);
+        if (selectResult > 0) {
+            memset(ack, 0, sizeof(ack));
+            recvfrom(socketS, ack, sizeof(ack), 0, (sockaddr*)&from, &fromlen);
+            printf("Received %s\n", ack);
+        }
+        else if (selectResult == 0) {
+            printf("Timeout, no ACK received. Resending first packet.\n");
+            continue;
+        }
+    } while (!(strncmp(ack, "ACK", 3) == 0));
+}
+bool sendDataPackets(SOCKET socketS, char* buffer_tx, int ata_len, sockaddr_in addrDest, sockaddr_in& from, int& fromlen, FILE* file, uint32_t packets) {
+    packets--; // protoze plnime od 0 ale realne prvni paket neni 0
+    char ack[10];
+    uint32_t ListOfSending[WINDOW_LENGTH];
+    size_t actualSizeOfSendingList = 0;
+    size_t sent = WINDOW_LENGTH;
+    int index_in_first_list = 0;
+    bool control = false;
+    const int maxLengthOfThisFucker = packets;
+    uint32_t ListOfSent[1];
+    for (size_t i = 1; i < WINDOW_LENGTH + 1; i++)
+    {
+        ListOfSending[index_in_first_list] = i;
+        printf("%d in first list", i);
+        actualSizeOfSendingList++;
+        index_in_first_list++;
+    }
+    while (true)
+    {
+        for (size_t i = 0; i < WINDOW_LENGTH; i++)
+        {
+            if (ListOfSending[i] != 0) {
+                memset(buffer_tx, 0, BUFFERS_LEN);
+                long offset = ListOfSending[i] * DATA_LEN;
+                printf("%d offset", offset);
+                fseek(file, offset, SEEK_SET);
+                fread(buffer_tx + NUMBER_LEN, sizeof(char), DATA_LEN, file);
+                memcpy(buffer_tx, &ListOfSending[i], sizeof(uint32_t));
+                uint32_t crc_value = crc32(buffer_tx, DATA_LEN + NUMBER_LEN);
+                memcpy(buffer_tx + DATA_LEN + NUMBER_LEN, &crc_value, sizeof(crc_value));
+                printf("number sent %d\n", ListOfSending[i]);
+                sendto(socketS, buffer_tx, DATA_LEN + NUMBER_LEN + CRC_LEN, 0, (sockaddr*)&addrDest, sizeof(addrDest));
+                Sleep(10);
+            }
+        }
+
+        for (size_t i = 0; i < WINDOW_LENGTH; i++)
+        {
+            if (ListOfSending[i] != 0) {
+                memset(buffer_tx, 0, BUFFERS_LEN);
+                /**/fd_set read_fds;
+                FD_ZERO(&read_fds);
+                FD_SET(socketS, &read_fds);
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 5000; //95 ms
+                int selectResult = select(socketS + 1, &read_fds, NULL, NULL, &tv);
+                if (selectResult > 0) {
+                    recvfrom(socketS, buffer_tx, sizeof(ack) + sizeof(uint32_t) + sizeof(uint32_t), 0, (sockaddr*)&from, &fromlen);
+                    uint32_t received_crc;
+                    memcpy(&received_crc, buffer_tx + sizeof(ack) + sizeof(uint32_t), sizeof(received_crc)); // Extrahujeme CRC z p�ijat�ho bufferu
+                    uint32_t calculated_crc = crc32(buffer_tx, sizeof(ack) + sizeof(uint32_t)); // Vypo��t�me CRC z dat
+                    uint32_t current_packet_number;
+                    memcpy(&current_packet_number, buffer_tx + sizeof(ack), sizeof(current_packet_number));
+                    memcpy(&ack, buffer_tx, sizeof(ack));
+                    if ((strncmp(ack, "ACK", 3) == 0) && (received_crc == calculated_crc))
+                    {
+                        printf("Received ACK for package %d \n", current_packet_number);
+
+                        for (size_t k = 0; k < WINDOW_LENGTH; k++)
+                        {
+                            if (ListOfSending[k] == current_packet_number && sent <= packets-1)
+                            {
+                                sent++;
+                                ListOfSending[k] = sent;
+                                control = true;
+                                printf("odbaveno %d prislo\n", current_packet_number);
+
+                            }
+                            else if (ListOfSending[k] == current_packet_number) {
+                                ListOfSending[k] = 0;
+                                size_t numOfNuls = 0;
+                                control = true;
+                                for (size_t j = 0; j < WINDOW_LENGTH; j++)
+                                {
+                                    if (ListOfSending[j] == 0)
+                                    {
+                                        numOfNuls++;
+                                    }
+                                    if (numOfNuls == WINDOW_LENGTH)
+                                    {
+                                        printf("DOPOSLANO\n");
+                                        return true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (!control) {
+                            printf("ITS BROKEN SEM TO DOJIT NEMELO%d prislo\n", current_packet_number);
+                        }
+                        control = false;
+
+                    }
+                    else {
+                        char acks[4];
+                        memset(&acks, 0, 4);
+                        memcpy(&acks, ack, 3);
+
+                        printf("%s recieved or wrong CRC\n", acks);
+                    }
+
+                }
+                else if (selectResult == 0) {
+                    printf("Timeout, no ACK received for packet %d.\n", ListOfSending[i]);
+                    continue;
+                }
+            }
+        }
+    }
 }
 void sendTextPacket(SOCKET socketS, char* buffer_tx, sockaddr_in addrDest, sockaddr_in& from, int& fromlen, int data_len, char* text) {
     char ack[10];
@@ -371,6 +602,12 @@ void sendTextPacket(SOCKET socketS, char* buffer_tx, sockaddr_in addrDest, socka
             continue;
         }
     } while (!(memcmp(ack, "ACK", 3) == 0)); // Opakov�n� odesl�n�, pokud p�ijde "NACK"
+}
+void fillBuffer(FILE* fp, char* buffer, uint32_t packetNum) {
+    size_t offset = packetNum * DATA_LEN;
+    fseek(fp, offset, SEEK_SET);
+
+
 }
 void compute_md5(FILE* file, unsigned char digest[16]) {
     MD5_CTX context;
@@ -421,74 +658,73 @@ int main()
 
 #ifdef SENDER
     sockaddr_in addrDest;
-	addrDest.sin_family = AF_INET;
-	addrDest.sin_port = htons(TARGET_PORT);
-	InetPton(AF_INET, _T(TARGET_IP), &addrDest.sin_addr.s_addr);
-	char ack[10];
-	uint32_t crc_value;
+    addrDest.sin_family = AF_INET;
+    addrDest.sin_port = htons(TARGET_PORT);
+    InetPton(AF_INET, _T(TARGET_IP), &addrDest.sin_addr.s_addr);
+    char ack[10];
+    uint32_t crc_value;
 
-	char filename[50];
-	printf("zadejte nazev souboru\n");
-	scanf("%50s", &filename);
-	printf("%s\n", filename);
-	FILE* file = fopen(filename, "rb");
-	if (file == NULL) {
-		fprintf(stderr, "Error: File not opened!\n");
-		return 1;
-	}
-	compute_md5(file, digest);
-	printf("Hash of file is: ");
-	for (int i = 0; i < 16; i++) {
-		printf("%02x", digest[i]);
-	}
-	printf("\n");
-
-
-	fseek(file, 0, SEEK_END);
-	int size = ftell(file);
-	fseek(file, 0, SEEK_SET);
-	printf("size is %d\n", size);
-
-	strncpy(buffer_tx, "", BUFFERS_LEN);
-	char* name = "name";
-	printf("Sending packet with name.\n");
-	strncpy(buffer_tx + sizeof(name), filename, data_len - sizeof(name));
-	strncpy(buffer_tx, name, sizeof(name));
-	sendTextPacket(socketS, buffer_tx, addrDest, from, fromlen, data_len, "name");
-	printf("packet send\n");
-	printf("Sending packet with Hash.\n");
-	strncpy(buffer_tx, "", BUFFERS_LEN);
-	char* hash = "hash";
-	memcpy(buffer_tx + sizeof(hash), digest, data_len - sizeof(hash));
-	strncpy(buffer_tx, hash, sizeof(hash));
-	sendTextPacket(socketS, buffer_tx, addrDest, from, fromlen, data_len, "hash");
-	printf("packet send\n");
-
-	char* sizechar = "size";
-	strncpy(buffer_tx, "", BUFFERS_LEN);
-	memcpy(buffer_tx + sizeof(sizechar), &size, data_len - sizeof(sizechar));
-	strncpy(buffer_tx, sizechar, sizeof(sizechar));
-	printf("Sending packet with size.\n");
-	sendTextPacket(socketS, buffer_tx, addrDest, from, fromlen, data_len, "size");
-
-	int num_of_packets = size / (data_len - sizeof(uint32_t));
-	for (int i = 0; i < num_of_packets; i++) {
-		strncpy(buffer_tx, "", BUFFERS_LEN);
-		sendDataPacket(socketS, buffer_tx, data_len, addrDest, from, fromlen, file, i);
-
-		printf("Packet number %d sent.\n", i + 1);
-		Sleep(10);
-	}
-
-	if (size % data_len != 0) {
-		strncpy(buffer_tx, "", BUFFERS_LEN);
-		sendDataPacket(socketS, buffer_tx, data_len, addrDest, from, fromlen, file, -1);
-		printf("Packet the rest.\n");
-	}
+    char filename[50];
+    printf("zadejte nazev souboru\n");
+    scanf("%50s", &filename);
+    printf("%s\n", filename);
+    FILE* file = fopen(filename, "rb");
+    if (file == NULL) {
+        fprintf(stderr, "Error: File not opened!\n");
+        return 1;
+    }
+    compute_md5(file, digest);
+    printf("Hash of file is: ");
+    for (int i = 0; i < 16; i++) {
+        printf("%02x", digest[i]);
+    }
+    printf("\n");
 
 
-	fclose(file);
-	closesocket(socketS);
+    fseek(file, 0, SEEK_END);
+    int size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    printf("size is %d\n", size);
+
+    strncpy(buffer_tx, "", BUFFERS_LEN);
+    char* name = "name";
+    printf("Sending packet with name.\n");
+    strncpy(buffer_tx + sizeof(name), filename, data_len - sizeof(name));
+    strncpy(buffer_tx, name, sizeof(name));
+    sendTextPacket(socketS, buffer_tx, addrDest, from, fromlen, data_len, "name");
+    printf("packet send\n");
+    printf("Sending packet with Hash.\n");
+    strncpy(buffer_tx, "", BUFFERS_LEN);
+    char* hash = "hash";
+    memcpy(buffer_tx + sizeof(hash), digest, data_len - sizeof(hash));
+    strncpy(buffer_tx, hash, sizeof(hash));
+    sendTextPacket(socketS, buffer_tx, addrDest, from, fromlen, data_len, "hash");
+    printf("packet send\n");
+
+    char* sizechar = "size";
+    strncpy(buffer_tx, "", BUFFERS_LEN);
+    memcpy(buffer_tx + sizeof(sizechar), &size, data_len - sizeof(sizechar));
+    strncpy(buffer_tx, sizechar, sizeof(sizechar));
+    printf("Sending packet with size.\n");
+    sendTextPacket(socketS, buffer_tx, addrDest, from, fromlen, data_len, "size");
+
+    sendFirstDataPacket(socketS, buffer_tx, data_len, addrDest, from, fromlen, file, 0);
+    int num_of_packets = size / DATA_LEN;
+    strncpy(buffer_tx, "", BUFFERS_LEN);
+    Sleep(100);
+    sendDataPackets(socketS, buffer_tx, data_len, addrDest, from, fromlen, file, num_of_packets);
+
+    Sleep(50 * WINDOW_LENGTH + 100 * WINDOW_LENGTH * 10);
+    if (size % data_len != 0) {
+        //upravit tady pozici fp
+        strncpy(buffer_tx, "", BUFFERS_LEN);
+        sendLastDataPacket(socketS, buffer_tx, data_len, addrDest, from, fromlen, file, -1, num_of_packets, size);
+        printf("Packet the rest.\n");
+    }
+
+
+    fclose(file);
+    closesocket(socketS);
 #endif // SENDER
 
 #ifdef RECEIVER
@@ -615,23 +851,36 @@ int main()
     printf("Number of packets size %d\n", packet_num);
 
     printf("Receiveing data...\n");
-
-    for (int i = 0; i < packet_num;) {
+    success = false;
+    do {
         memset(buffer_rx, 0, BUFFERS_LEN);
         recvfrom(socketS, buffer_rx, BUFFERS_LEN, 0, (sockaddr*)&from, &fromlen);
-        bool success = processReceivedPacket(socketS, buffer_rx, data_len, fp, from, addrDest, i, lastBuffer, &last_packet_number, size);
-        if (success)
-        {
-            i++;
+        memcpy(&received_crc, buffer_rx + data_len, sizeof(received_crc));
+        calculated_crc = crc32(buffer_rx, data_len);
+        if (!(memcmp(sizechar, buffer_rx, sizeof(sizechar)) == 0) && received_crc == calculated_crc) {
+            printf("Packet first received correctly.\n");
+            fwrite(buffer_rx + sizeof(uint32_t), 1, data_len - sizeof(uint32_t) * sizeof(char), fp);
+            success = true;
         }
+        if (received_crc == calculated_crc) {
+            sendto(socketS, "ACK", 3, 0, (sockaddr*)&addrDest, sizeof(addrDest));
+        }
+        else
+        {
+            sendto(socketS, "NACK", 4, 0, (sockaddr*)&addrDest, sizeof(addrDest));
+            printf("Packet first  received NOT correctly.\n");
+        }
+    } while (!success);
+    memset(buffer_rx, 0, BUFFERS_LEN);
+    processReceivedPackets(socketS, buffer_rx, data_len, fp, from, addrDest, lastBuffer, &last_packet_number, size, fromlen);
 
-    }
     for (int i = 0; i < 1;)
     {
+        //upravit pozici FP
         int lol = -1;
         memset(buffer_rx, 0, BUFFERS_LEN);
         recvfrom(socketS, buffer_rx, BUFFERS_LEN, 0, (sockaddr*)&from, &fromlen);
-        bool success = processReceivedPacket(socketS, buffer_rx, data_len, fp, from, addrDest, lol, lastBuffer, &last_packet_number, size);
+        bool success = processReceivedPacket(socketS, buffer_rx, data_len, fp, from, addrDest, lol, lastBuffer, &last_packet_number, size, packet_num);
         if (success)
         {
             i++;
